@@ -77,7 +77,8 @@ static AppConfiguration g_configuration;
 static std::atomic<bool> g_defaultDeviceIsLg(false);
 static std::atomic<bool> g_dolbyAtmosActive(false);
 static std::atomic<bool> g_useTvVolume(false);
-static bool g_tvMuted = false;
+static std::atomic<bool> g_tvMuted(false);
+static std::wstring g_defaultDeviceName;
 
 static ComPtr<IAudioEndpointVolume> g_endpointVolume;
 static float g_prevVolumeScalar = 0.25f;
@@ -146,23 +147,28 @@ namespace Ui
         SetWindowTextW(g_handles.statusConnectionValue, buffer);
 
         SetWindowTextW(g_handles.statusMacValue, g_configuration.tvMacAddress.c_str());
-        SetWindowTextW(g_handles.statusDeviceNameValue, g_configuration.deviceNameHint.c_str());
+
+        const wchar_t* deviceNameToShow =
+            !g_defaultDeviceName.empty()
+            ? g_defaultDeviceName.c_str()
+            : g_configuration.deviceNameHint.c_str();
+        SetWindowTextW(g_handles.statusDeviceNameValue, deviceNameToShow);
 
         SetWindowTextW(
             g_handles.statusRoutingValue,
-            g_useTvVolume.load() ? L"TV volume" : L"Windows volume");
+            g_useTvVolume.load() ? L"TV" : L"Windows");
 
         SetWindowTextW(
             g_handles.statusDefaultLgValue,
-            g_defaultDeviceIsLg.load() ? L"yes" : L"no");
+            g_defaultDeviceIsLg.load() ? L"Yes" : L"No");
 
         SetWindowTextW(
             g_handles.statusAtmosValue,
-            g_dolbyAtmosActive.load() ? L"yes" : L"no");
+            g_dolbyAtmosActive.load() ? L"Yes" : L"No");
 
         SetWindowTextW(
             g_handles.statusPairingValue,
-            GetTVClient().HasClientKey() ? L"paired" : L"not paired");
+            GetTVClient().HasClientKey() ? L"Yes" : L"No");
     }
 
     /// Creates the tray icon associated with the main window.
@@ -373,6 +379,7 @@ private:
             DebugLog(L"[Audio] GetDefaultAudioEndpoint failed: 0x%08X\n", hr);
             g_defaultDeviceIsLg = false;
             g_dolbyAtmosActive = false;
+            g_defaultDeviceName.clear();
             g_endpointVolume.Reset();
             UpdateRouting();
             return hr;
@@ -406,12 +413,18 @@ private:
     bool IsLgDevice(IMMDevice* device)
     {
         if (!device)
+        {
+            g_defaultDeviceName.clear();
             return false;
+        }
 
         ComPtr<IPropertyStore> props;
         HRESULT hr = device->OpenPropertyStore(STGM_READ, &props);
         if (FAILED(hr))
+        {
+            g_defaultDeviceName.clear();
             return false;
+        }
 
         PROPVARIANT varName;
         PropVariantInit(&varName);
@@ -420,6 +433,7 @@ private:
         if (FAILED(hr))
         {
             PropVariantClear(&varName);
+            g_defaultDeviceName.clear();
             return false;
         }
 
@@ -427,6 +441,7 @@ private:
         if (varName.vt == VT_LPWSTR && varName.pwszVal)
         {
             std::wstring name(varName.pwszVal);
+            g_defaultDeviceName = name;
             std::wstring nameLower = ToLower(name);
             std::wstring hintLower = ToLower(g_configuration.deviceNameHint);
 
@@ -438,6 +453,10 @@ private:
 
             DebugLog(L"[Audio] Endpoint name: %s, hint: %s, match=%d\n",
                 name.c_str(), g_configuration.deviceNameHint.c_str(), result ? 1 : 0);
+        }
+        else
+        {
+            g_defaultDeviceName.clear();
         }
 
         PropVariantClear(&varName);
@@ -485,6 +504,13 @@ static void UpdateRouting()
             useTv = g_dolbyAtmosActive.load();
         else
             useTv = true;
+    }
+
+    // TV routing is only active when the default device matches
+    // and the app is currently paired with a TV.
+    if (useTv && !GetTVClient().HasClientKey())
+    {
+        useTv = false;
     }
 
     bool prevUse = g_useTvVolume.load();
@@ -574,7 +600,7 @@ static void CreateChildControls(HWND hWnd)
     HWND titleConnection = CreateWindowExW(
         0,
         L"STATIC",
-        L"TV connection",
+        L"Connection",
         WS_CHILD | WS_VISIBLE,
         marginX,
         y,
@@ -607,7 +633,7 @@ static void CreateChildControls(HWND hWnd)
     HWND labelTvIp = CreateWindowExW(
         0,
         L"STATIC",
-        L"TV IP:",
+        L"IP Address:",
         WS_CHILD | WS_VISIBLE,
         marginX + 10,
         rowY,
@@ -638,7 +664,7 @@ static void CreateChildControls(HWND hWnd)
     HWND labelTvMac = CreateWindowExW(
         0,
         L"STATIC",
-        L"TV MAC:",
+        L"MAC Address:",
         WS_CHILD | WS_VISIBLE,
         marginX + 10,
         rowY,
@@ -669,7 +695,7 @@ static void CreateChildControls(HWND hWnd)
     HWND labelDeviceHint = CreateWindowExW(
         0,
         L"STATIC",
-        L"Device name hint:",
+        L"Device Name Hint:",
         WS_CHILD | WS_VISIBLE,
         marginX + 10,
         rowY,
@@ -697,31 +723,10 @@ static void CreateChildControls(HWND hWnd)
     applyFont(Ui::g_handles.editDeviceHint);
     rowY += controlHeight + 6;
 
-    Ui::g_handles.checkUseSecure = CreateWindowExW(
-        0,
-        L"BUTTON",
-        L"Use secure WebSocket (wss, port 3001)",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        marginX + 10,
-        rowY,
-        groupWidth - 20,
-        controlHeight,
-        hWnd,
-        (HMENU)IDC_CHECK_USE_SECURE,
-        hInst,
-        nullptr);
-    applyFont(Ui::g_handles.checkUseSecure);
-    SendMessageW(
-        Ui::g_handles.checkUseSecure,
-        BM_SETCHECK,
-        g_configuration.useSecureWebSocket ? BST_CHECKED : BST_UNCHECKED,
-        0);
-    rowY += controlHeight + 6;
-
     HWND labelTvPort = CreateWindowExW(
         0,
         L"STATIC",
-        L"TV port:",
+        L"Port:",
         WS_CHILD | WS_VISIBLE,
         marginX + 10,
         rowY,
@@ -750,6 +755,27 @@ static void CreateChildControls(HWND hWnd)
         nullptr);
     applyFont(Ui::g_handles.editTvPort);
     rowY += controlHeight + 10;
+
+    Ui::g_handles.checkUseSecure = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Use Secure WebSocket (WSS, port 3001)",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        marginX + 10,
+        rowY,
+        groupWidth - 20,
+        controlHeight,
+        hWnd,
+        (HMENU)IDC_CHECK_USE_SECURE,
+        hInst,
+        nullptr);
+    applyFont(Ui::g_handles.checkUseSecure);
+    SendMessageW(
+        Ui::g_handles.checkUseSecure,
+        BM_SETCHECK,
+        g_configuration.useSecureWebSocket ? BST_CHECKED : BST_UNCHECKED,
+        0);
+    rowY += controlHeight + 6;
 
     int connectionBottom = rowY;
     SetWindowPos(
@@ -799,7 +825,7 @@ static void CreateChildControls(HWND hWnd)
     Ui::g_handles.checkOnlyAtmos = CreateWindowExW(
         0,
         L"BUTTON",
-        L"Use TV volume only when Atmos is active",
+        L"Use TV volume only when Dolby Atmos is active",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
         marginX + 10,
         routingRowY,
@@ -832,7 +858,7 @@ static void CreateChildControls(HWND hWnd)
     HWND titleControl = CreateWindowExW(
         0,
         L"STATIC",
-        L"Pairing and control",
+        L"Control and Pairing",
         WS_CHILD | WS_VISIBLE,
         marginX,
         y,
@@ -993,13 +1019,13 @@ static void CreateChildControls(HWND hWnd)
         statusRowY += controlHeight + 4;
     };
 
+    createStatusRow(L"Paired:", Ui::g_handles.statusPairingValue);
     createStatusRow(L"Connection:", Ui::g_handles.statusConnectionValue);
-    createStatusRow(L"TV MAC:", Ui::g_handles.statusMacValue);
-    createStatusRow(L"Device name:", Ui::g_handles.statusDeviceNameValue);
-    createStatusRow(L"Routing:", Ui::g_handles.statusRoutingValue);
-    createStatusRow(L"Default LG:", Ui::g_handles.statusDefaultLgValue);
-    createStatusRow(L"Atmos:", Ui::g_handles.statusAtmosValue);
-    createStatusRow(L"Pairing:", Ui::g_handles.statusPairingValue);
+    createStatusRow(L"MAC Address:", Ui::g_handles.statusMacValue);
+    createStatusRow(L"Device Name:", Ui::g_handles.statusDeviceNameValue);
+    createStatusRow(L"Is Default Device:", Ui::g_handles.statusDefaultLgValue);
+    createStatusRow(L"Dolby Atmos:", Ui::g_handles.statusAtmosValue);
+    createStatusRow(L"Volume Routing:", Ui::g_handles.statusRoutingValue);
 
     int statusBottom = statusRowY + 8;
     SetWindowPos(
@@ -1103,6 +1129,54 @@ static void ApplyConfigFromUI()
     UpdateRouting();
 }
 
+/// Represents a queued TV volume action to be processed off the hook/UI thread.
+enum class TvVolumeAction
+{
+    VolumeUp = 0,
+    VolumeDown = 1,
+    ToggleMute = 2
+};
+
+/// Worker function that executes a TV volume action on a thread pool thread.
+static DWORD WINAPI TvVolumeWorkerProc(_In_ LPVOID parameter)
+{
+    TvVolumeAction action =
+        static_cast<TvVolumeAction>(reinterpret_cast<intptr_t>(parameter));
+
+    bool handled = false;
+
+    switch (action)
+    {
+    case TvVolumeAction::VolumeUp:
+        handled = GetTVClient().VolumeUp();
+        break;
+    case TvVolumeAction::VolumeDown:
+        handled = GetTVClient().VolumeDown();
+        break;
+    case TvVolumeAction::ToggleMute:
+    {
+        bool previousMuted = g_tvMuted.load();
+        bool newMuted = !previousMuted;
+        handled = GetTVClient().SetMute(newMuted);
+        if (handled)
+        {
+            g_tvMuted.store(newMuted);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    if (!handled)
+    {
+        DebugLog(L"[Key] TV volume command failed for action=%d",
+            static_cast<int>(action));
+    }
+
+    return 0;
+}
+
 /// Low-level keyboard hook used to intercept global volume keys.
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
@@ -1120,46 +1194,48 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
                 if (g_useTvVolume.load())
                 {
-                    bool handled = false;
+                    TvVolumeAction action = TvVolumeAction::VolumeUp;
                     switch (pkb->vkCode)
                     {
                     case VK_VOLUME_UP:
-                        handled = GetTVClient().VolumeUp();
+                        action = TvVolumeAction::VolumeUp;
                         break;
                     case VK_VOLUME_DOWN:
-                        handled = GetTVClient().VolumeDown();
+                        action = TvVolumeAction::VolumeDown;
                         break;
                     case VK_VOLUME_MUTE:
-                    {
-                        bool newMute = !g_tvMuted;
-                        handled = GetTVClient().SetMute(newMute);
-                        if (handled)
-                        {
-                            g_tvMuted = newMute;
-                        }
+                        action = TvVolumeAction::ToggleMute;
+                        break;
+                    default:
                         break;
                     }
+
+                    if (!QueueUserWorkItem(
+                        TvVolumeWorkerProc,
+                        reinterpret_cast<LPVOID>(static_cast<intptr_t>(action)),
+                        WT_EXECUTEDEFAULT))
+                    {
+                        ErrorLog(L"[Key] QueueUserWorkItem failed: %lu", GetLastError());
                     }
 
-                    if (handled)
+                    // Keep endpoint volume pinned to 100% while routing to TV.
+                    if (g_endpointVolume)
                     {
-                        // Keep endpoint volume pinned to 100%
-                        if (g_endpointVolume)
+                        if (IsEqualGUID(g_volumeEventContext, GUID_NULL))
                         {
-                            if (IsEqualGUID(g_volumeEventContext, GUID_NULL))
+                            HRESULT guidResult = CoCreateGuid(&g_volumeEventContext);
+                            if (FAILED(guidResult))
                             {
-                                HRESULT guidResult = CoCreateGuid(&g_volumeEventContext);
-                                if (FAILED(guidResult))
-                                {
-                                    ErrorLog(L"[Audio] CoCreateGuid failed: 0x%08X", guidResult);
-                                }
+                                ErrorLog(L"[Audio] CoCreateGuid failed: 0x%08X", guidResult);
                             }
-                            g_endpointVolume->SetMasterVolumeLevelScalar(
-                                1.0f, &g_volumeEventContext);
                         }
-                        return 1; // swallow key so Windows does not also change volume
+                        g_endpointVolume->SetMasterVolumeLevelScalar(
+                            1.0f, &g_volumeEventContext);
                     }
-                    // If TV call failed, fall through and let OS handle it
+
+                    // Swallow the key so Windows does not also change volume,
+                    // even if the TV command later fails.
+                    return 1;
                 }
             }
         }
@@ -1356,6 +1432,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     MB_OK | MB_ICONERROR);
             }
 
+            UpdateRouting();
             Ui::UpdateStatusText();
             break;
         }
@@ -1418,6 +1495,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         MB_OK | MB_ICONERROR);
                 }
 
+                UpdateRouting();
                 Ui::UpdateStatusText();
             }
             break;

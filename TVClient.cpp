@@ -829,9 +829,6 @@ bool LGWebOSClient::VerifyMacAddressMatchesConfiguration(bool showUserError)
     if (!ResolveMacForIp(configuration->tvIpAddress, resolvedMac))
     {
         ErrorLog(L"[LGTV] MAC verification: failed to resolve MAC for IP %s", configuration->tvIpAddress.c_str());
-        lastVerifiedIpAddress = configuration->tvIpAddress;
-        lastVerifiedMacAddress = configuration->tvMacAddress;
-        lastMacVerificationResult = false;
         if (showUserError)
         {
             MessageBoxW(
@@ -841,6 +838,8 @@ bool LGWebOSClient::VerifyMacAddressMatchesConfiguration(bool showUserError)
                 L"LG TV Volume Proxy - MAC verification",
                 MB_OK | MB_ICONERROR);
         }
+        // Do not cache failures so that we can retry MAC resolution
+        // when the TV or network becomes reachable again.
         return false;
     }
 
