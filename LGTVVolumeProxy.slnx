@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="LGTVVolumeProxy.vcxproj" Id="cb1de823-cf08-4f83-9cfe-3369586b178b" />
+</Solution>
