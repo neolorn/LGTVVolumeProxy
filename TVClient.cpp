@@ -15,6 +15,28 @@
 
 namespace
 {
+    struct ScopedCriticalSection
+    {
+        CRITICAL_SECTION* section;
+
+        explicit ScopedCriticalSection(CRITICAL_SECTION* value)
+            : section(value)
+        {
+            if (section)
+            {
+                EnterCriticalSection(section);
+            }
+        }
+
+        ~ScopedCriticalSection()
+        {
+            if (section)
+            {
+                LeaveCriticalSection(section);
+            }
+        }
+    };
+
     std::string WideToUtf8(const std::wstring& value)
     {
         if (value.empty())
@@ -122,30 +144,64 @@ LGWebOSClient::LGWebOSClient()
     : configuration(nullptr),
     lastVerifiedIpAddress(),
     lastVerifiedMacAddress(),
-    lastMacVerificationResult(false)
+    lastMacVerificationResult(false),
+    persistentWebSocket(nullptr),
+    persistentRegistered(false),
+    cachedClientKey(),
+    clientKeyLoaded(false)
 {
+    InitializeCriticalSection(&lock);
+}
+
+LGWebOSClient::~LGWebOSClient()
+{
+    ScopedCriticalSection guard(&lock);
+    if (persistentWebSocket)
+    {
+        CloseWebSocket(persistentWebSocket);
+        persistentWebSocket = nullptr;
+        persistentRegistered = false;
+    }
+
+    DeleteCriticalSection(&lock);
 }
 
 void LGWebOSClient::SetConfiguration(const AppConfiguration* configurationValue)
 {
+    ScopedCriticalSection guard(&lock);
+
     configuration = configurationValue;
     lastVerifiedIpAddress.clear();
     lastVerifiedMacAddress.clear();
     lastMacVerificationResult = false;
+
+    cachedClientKey.clear();
+    clientKeyLoaded = false;
+
+    if (persistentWebSocket)
+    {
+        CloseWebSocket(persistentWebSocket);
+        persistentWebSocket = nullptr;
+        persistentRegistered = false;
+    }
 }
 
 bool LGWebOSClient::VolumeUp()
 {
+    ScopedCriticalSection guard(&lock);
     return SendSimpleCommand("ssap://audio/volumeUp");
 }
 
 bool LGWebOSClient::VolumeDown()
 {
+    ScopedCriticalSection guard(&lock);
     return SendSimpleCommand("ssap://audio/volumeDown");
 }
 
 bool LGWebOSClient::ToggleMute()
 {
+    ScopedCriticalSection guard(&lock);
+
     std::string clientKey = LoadClientKey();
     if (clientKey.empty())
     {
@@ -153,35 +209,24 @@ bool LGWebOSClient::ToggleMute()
         return false;
     }
 
-    HINTERNET webSocketHandle = nullptr;
-    if (!Connect(webSocketHandle))
+    if (!EnsurePersistentConnection(clientKey))
     {
         return false;
     }
-
-    if (!SendRegister(webSocketHandle, clientKey))
-    {
-        DebugLog(L"[LGTV] ToggleMute: SendRegister failed");
-        CloseWebSocket(webSocketHandle);
-        return false;
-    }
-
-    std::string temporary;
-    ReceiveOneTextMessage(webSocketHandle, temporary);
 
     std::string getStatusRequest = BuildRequestMessage("ssap://audio/getStatus", nullptr);
-    if (!SendText(webSocketHandle, getStatusRequest))
+    if (!SendText(persistentWebSocket, getStatusRequest))
     {
         DebugLog(L"[LGTV] ToggleMute: send getStatus failed");
-        CloseWebSocket(webSocketHandle);
+        ResetPersistentConnection();
         return false;
     }
 
     std::string statusResponse;
-    if (!ReceiveOneTextMessage(webSocketHandle, statusResponse))
+    if (!ReceiveOneTextMessage(persistentWebSocket, statusResponse))
     {
         DebugLog(L"[LGTV] ToggleMute: receive getStatus failed");
-        CloseWebSocket(webSocketHandle);
+        ResetPersistentConnection();
         return false;
     }
 
@@ -191,8 +236,12 @@ bool LGWebOSClient::ToggleMute()
         DebugLog(L"[LGTV] ToggleMute: failed to parse muted flag, forcing mute=true");
         std::string payload = "{\"mute\":true}";
         std::string setMuteRequest = BuildRequestMessage("ssap://audio/setMute", payload.c_str());
-        SendText(webSocketHandle, setMuteRequest);
-        CloseWebSocket(webSocketHandle);
+        if (!SendText(persistentWebSocket, setMuteRequest))
+        {
+            ResetPersistentConnection();
+            return false;
+        }
+
         return true;
     }
 
@@ -201,14 +250,19 @@ bool LGWebOSClient::ToggleMute()
         std::string("{\"mute\":") + (newMuted ? "true" : "false") + "}";
     std::string setMuteRequest =
         BuildRequestMessage("ssap://audio/setMute", payload.c_str());
-    SendText(webSocketHandle, setMuteRequest);
+    if (!SendText(persistentWebSocket, setMuteRequest))
+    {
+        ResetPersistentConnection();
+        return false;
+    }
 
-    CloseWebSocket(webSocketHandle);
     return true;
 }
 
 bool LGWebOSClient::PairWithTv(HWND parentWindow)
 {
+    ScopedCriticalSection guard(&lock);
+
     DebugLog(L"[LGTV] PairWithTv: starting");
 
     if (!VerifyMacAddressMatchesConfiguration(true))
@@ -285,6 +339,8 @@ bool LGWebOSClient::PairWithTv(HWND parentWindow)
 
 bool LGWebOSClient::UnpairFromTv()
 {
+    ScopedCriticalSection guard(&lock);
+
     if (!HasClientKey())
     {
         DebugLog(L"[LGTV] UnpairFromTv: no client key present");
@@ -303,11 +359,14 @@ bool LGWebOSClient::UnpairFromTv()
 
 bool LGWebOSClient::HasClientKey() const
 {
+    ScopedCriticalSection guard(const_cast<CRITICAL_SECTION*>(&lock));
     return !LoadClientKey().empty();
 }
 
 bool LGWebOSClient::SetVolume(int volumeLevel)
 {
+    ScopedCriticalSection guard(&lock);
+
     if (volumeLevel < 0)
     {
         volumeLevel = 0;
@@ -319,6 +378,8 @@ bool LGWebOSClient::SetVolume(int volumeLevel)
 
 bool LGWebOSClient::SetMute(bool mute)
 {
+    ScopedCriticalSection guard(&lock);
+
     std::string payload =
         std::string("{\"mute\":") + (mute ? "true" : "false") + "}";
     return SendCommandWithPayload("ssap://audio/setMute", payload.c_str());
@@ -333,26 +394,18 @@ bool LGWebOSClient::SendSimpleCommand(const char* uri)
         return false;
     }
 
-    HINTERNET webSocketHandle = nullptr;
-    if (!Connect(webSocketHandle))
+    if (!EnsurePersistentConnection(clientKey))
     {
         return false;
     }
-
-    if (!SendRegister(webSocketHandle, clientKey))
-    {
-        DebugLog(L"[LGTV] SendSimpleCommand: SendRegister failed");
-        CloseWebSocket(webSocketHandle);
-        return false;
-    }
-
-    std::string acknowledge;
-    ReceiveOneTextMessage(webSocketHandle, acknowledge);
 
     std::string request = BuildRequestMessage(uri, nullptr);
-    SendText(webSocketHandle, request);
+    if (!SendText(persistentWebSocket, request))
+    {
+        ResetPersistentConnection();
+        return false;
+    }
 
-    CloseWebSocket(webSocketHandle);
     return true;
 }
 
@@ -365,26 +418,18 @@ bool LGWebOSClient::SendCommandWithPayload(const char* uri, const char* payload)
         return false;
     }
 
-    HINTERNET webSocketHandle = nullptr;
-    if (!Connect(webSocketHandle))
+    if (!EnsurePersistentConnection(clientKey))
     {
         return false;
     }
-
-    if (!SendRegister(webSocketHandle, clientKey))
-    {
-        DebugLog(L"[LGTV] SendCommandWithPayload: SendRegister failed");
-        CloseWebSocket(webSocketHandle);
-        return false;
-    }
-
-    std::string acknowledge;
-    ReceiveOneTextMessage(webSocketHandle, acknowledge);
 
     std::string request = BuildRequestMessage(uri, payload);
-    SendText(webSocketHandle, request);
+    if (!SendText(persistentWebSocket, request))
+    {
+        ResetPersistentConnection();
+        return false;
+    }
 
-    CloseWebSocket(webSocketHandle);
     return true;
 }
 
@@ -639,6 +684,67 @@ void LGWebOSClient::CloseWebSocket(HINTERNET webSocketHandle)
     WinHttpCloseHandle(webSocketHandle);
 }
 
+bool LGWebOSClient::EnsurePersistentConnection(const std::string& clientKey)
+{
+    if (!configuration)
+    {
+        ErrorLog(L"[LGTV] EnsurePersistentConnection: configuration not set");
+        return false;
+    }
+
+    if (clientKey.empty())
+    {
+        DebugLog(L"[LGTV] EnsurePersistentConnection: empty client key");
+        return false;
+    }
+
+    if (!persistentWebSocket)
+    {
+        if (!Connect(persistentWebSocket))
+        {
+            return false;
+        }
+
+        persistentRegistered = false;
+    }
+
+    if (!persistentRegistered)
+    {
+        if (!SendRegister(persistentWebSocket, clientKey))
+        {
+            DebugLog(L"[LGTV] EnsurePersistentConnection: SendRegister failed");
+            CloseWebSocket(persistentWebSocket);
+            persistentWebSocket = nullptr;
+            persistentRegistered = false;
+            return false;
+        }
+
+        std::string acknowledge;
+        if (!ReceiveOneTextMessage(persistentWebSocket, acknowledge))
+        {
+            DebugLog(L"[LGTV] EnsurePersistentConnection: failed to receive register ack");
+            CloseWebSocket(persistentWebSocket);
+            persistentWebSocket = nullptr;
+            persistentRegistered = false;
+            return false;
+        }
+
+        persistentRegistered = true;
+    }
+
+    return true;
+}
+
+void LGWebOSClient::ResetPersistentConnection()
+{
+    if (persistentWebSocket)
+    {
+        CloseWebSocket(persistentWebSocket);
+        persistentWebSocket = nullptr;
+    }
+    persistentRegistered = false;
+}
+
 std::string LGWebOSClient::BuildRegisterMessage(const std::string& clientKey)
 {
     std::string message;
@@ -707,16 +813,23 @@ std::string LGWebOSClient::GetClientKeyPath() const
 
 std::string LGWebOSClient::LoadClientKey() const
 {
+    if (clientKeyLoaded)
+    {
+        return cachedClientKey;
+    }
+
     std::string path = GetClientKeyPath();
     std::ifstream input(path);
     if (!input)
     {
+        cachedClientKey.clear();
+        clientKeyLoaded = true;
         return {};
     }
 
-    std::string key;
-    std::getline(input, key);
-    return key;
+    std::getline(input, cachedClientKey);
+    clientKeyLoaded = true;
+    return cachedClientKey;
 }
 
 void LGWebOSClient::SaveClientKey(const std::string& key) const
@@ -729,6 +842,9 @@ void LGWebOSClient::SaveClientKey(const std::string& key) const
         return;
     }
     output << key;
+
+    cachedClientKey = key;
+    clientKeyLoaded = true;
 }
 
 bool LGWebOSClient::DeleteClientKey() const
@@ -740,7 +856,14 @@ bool LGWebOSClient::DeleteClientKey() const
     }
 
     int result = std::remove(path.c_str());
-    return result == 0;
+    if (result == 0)
+    {
+        cachedClientKey.clear();
+        clientKeyLoaded = true;
+        return true;
+    }
+
+    return false;
 }
 
 std::string LGWebOSClient::ParseClientKey(const std::string& json) const

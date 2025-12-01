@@ -10,6 +10,7 @@ class LGWebOSClient
 {
 public:
     LGWebOSClient();
+    ~LGWebOSClient();
 
     // Sets the configuration that supplies TV IP, MAC and port information.
     void SetConfiguration(const AppConfiguration* configuration);
@@ -60,10 +61,19 @@ private:
 
     bool VerifyMacAddressMatchesConfiguration(bool showUserError);
 
+    bool EnsurePersistentConnection(const std::string& clientKey);
+    void ResetPersistentConnection();
+
     const AppConfiguration* configuration;
     std::wstring lastVerifiedIpAddress;
     std::wstring lastVerifiedMacAddress;
     bool lastMacVerificationResult;
+
+    CRITICAL_SECTION lock;
+    HINTERNET persistentWebSocket;
+    bool persistentRegistered;
+    mutable std::string cachedClientKey;
+    mutable bool clientKeyLoaded;
 };
 
 // Returns the global LG webOS client instance.

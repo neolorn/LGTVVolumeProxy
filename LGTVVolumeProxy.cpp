@@ -10,10 +10,12 @@
 
 #include <string>
 #include <atomic>
+#include <deque>
 #include <fstream>
 #include <cwctype>
 #include <cstdarg>
 #include <cstdlib>
+#include <avrt.h>
 
 #include "AudioFormatAliases.h"
 #include "Configuration.h"
@@ -25,6 +27,7 @@
 #pragma comment(lib, "Uuid.lib")
 #pragma comment(lib, "Winhttp.lib")
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Avrt.lib")
 
 #define MAX_LOADSTRING 100
 
@@ -1137,12 +1140,16 @@ enum class TvVolumeAction
     ToggleMute = 2
 };
 
-/// Worker function that executes a TV volume action on a thread pool thread.
-static DWORD WINAPI TvVolumeWorkerProc(_In_ LPVOID parameter)
-{
-    TvVolumeAction action =
-        static_cast<TvVolumeAction>(reinterpret_cast<intptr_t>(parameter));
+static HANDLE g_tvVolumeWorkerThread = nullptr;
+static HANDLE g_tvVolumeWorkerEvent = nullptr;
+static CRITICAL_SECTION g_tvVolumeQueueLock;
+static bool g_tvVolumeQueueLockInitialized = false;
+static bool g_tvVolumeWorkerShutdown = false;
+static std::deque<TvVolumeAction> g_tvVolumeQueue;
 
+/// Executes a TV volume action on the TV client.
+static bool ExecuteTvVolumeAction(TvVolumeAction action)
+{
     bool handled = false;
 
     switch (action)
@@ -1174,7 +1181,175 @@ static DWORD WINAPI TvVolumeWorkerProc(_In_ LPVOID parameter)
             static_cast<int>(action));
     }
 
+    return handled;
+}
+
+/// Worker thread that processes queued TV volume actions at elevated priority.
+static DWORD WINAPI TvVolumeWorkerThreadProc(_In_ LPVOID)
+{
+    HANDLE mmcssHandle = nullptr;
+    DWORD taskIndex = 0;
+
+    mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (!mmcssHandle)
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
+    for (;;)
+    {
+        DWORD waitResult = WaitForSingleObject(g_tvVolumeWorkerEvent, INFINITE);
+        if (waitResult != WAIT_OBJECT_0)
+        {
+            break;
+        }
+
+        for (;;)
+        {
+            TvVolumeAction action = TvVolumeAction::VolumeUp;
+            bool haveWork = false;
+            bool shouldShutdown = false;
+
+            if (g_tvVolumeQueueLockInitialized)
+            {
+                EnterCriticalSection(&g_tvVolumeQueueLock);
+                if (!g_tvVolumeQueue.empty())
+                {
+                    action = g_tvVolumeQueue.front();
+                    g_tvVolumeQueue.pop_front();
+                    haveWork = true;
+                }
+                else if (g_tvVolumeWorkerShutdown)
+                {
+                    shouldShutdown = true;
+                }
+                LeaveCriticalSection(&g_tvVolumeQueueLock);
+            }
+
+            if (shouldShutdown)
+            {
+                goto ExitWorker;
+            }
+
+            if (!haveWork)
+            {
+                break;
+            }
+
+            ExecuteTvVolumeAction(action);
+        }
+    }
+
+ExitWorker:
+    if (mmcssHandle)
+    {
+        AvRevertMmThreadCharacteristics(mmcssHandle);
+    }
+
     return 0;
+}
+
+/// Initializes the worker thread and queue used for TV volume actions.
+static bool InitializeTvVolumeWorker()
+{
+    if (!g_tvVolumeQueueLockInitialized)
+    {
+        InitializeCriticalSection(&g_tvVolumeQueueLock);
+        g_tvVolumeQueueLockInitialized = true;
+    }
+
+    if (!g_tvVolumeWorkerEvent)
+    {
+        g_tvVolumeWorkerEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_tvVolumeWorkerEvent)
+        {
+            ErrorLog(L"[Key] CreateEvent for TV volume worker failed: %lu", GetLastError());
+            return false;
+        }
+    }
+
+    g_tvVolumeWorkerShutdown = false;
+
+    if (!g_tvVolumeWorkerThread)
+    {
+        g_tvVolumeWorkerThread = CreateThread(
+            nullptr,
+            0,
+            TvVolumeWorkerThreadProc,
+            nullptr,
+            0,
+            nullptr);
+        if (!g_tvVolumeWorkerThread)
+        {
+            ErrorLog(L"[Key] CreateThread for TV volume worker failed: %lu", GetLastError());
+            CloseHandle(g_tvVolumeWorkerEvent);
+            g_tvVolumeWorkerEvent = nullptr;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Shuts down the TV volume worker thread and cleans up resources.
+static void ShutdownTvVolumeWorker()
+{
+    if (g_tvVolumeQueueLockInitialized)
+    {
+        EnterCriticalSection(&g_tvVolumeQueueLock);
+        g_tvVolumeWorkerShutdown = true;
+        LeaveCriticalSection(&g_tvVolumeQueueLock);
+    }
+
+    if (g_tvVolumeWorkerEvent)
+    {
+        SetEvent(g_tvVolumeWorkerEvent);
+    }
+
+    if (g_tvVolumeWorkerThread)
+    {
+        WaitForSingleObject(g_tvVolumeWorkerThread, INFINITE);
+        CloseHandle(g_tvVolumeWorkerThread);
+        g_tvVolumeWorkerThread = nullptr;
+    }
+
+    if (g_tvVolumeWorkerEvent)
+    {
+        CloseHandle(g_tvVolumeWorkerEvent);
+        g_tvVolumeWorkerEvent = nullptr;
+    }
+
+    if (g_tvVolumeQueueLockInitialized)
+    {
+        EnterCriticalSection(&g_tvVolumeQueueLock);
+        g_tvVolumeQueue.clear();
+        LeaveCriticalSection(&g_tvVolumeQueueLock);
+        DeleteCriticalSection(&g_tvVolumeQueueLock);
+        g_tvVolumeQueueLockInitialized = false;
+    }
+
+    g_tvVolumeWorkerShutdown = false;
+}
+
+/// Enqueues a TV volume action to be processed by the worker thread.
+static bool EnqueueTvVolumeAction(TvVolumeAction action)
+{
+    if (!g_tvVolumeWorkerThread || !g_tvVolumeWorkerEvent || !g_tvVolumeQueueLockInitialized)
+    {
+        return false;
+    }
+
+    EnterCriticalSection(&g_tvVolumeQueueLock);
+    if (!g_tvVolumeWorkerShutdown)
+    {
+        g_tvVolumeQueue.push_back(action);
+        LeaveCriticalSection(&g_tvVolumeQueueLock);
+        SetEvent(g_tvVolumeWorkerEvent);
+        return true;
+    }
+
+    LeaveCriticalSection(&g_tvVolumeQueueLock);
+    return false;
 }
 
 /// Low-level keyboard hook used to intercept global volume keys.
@@ -1210,12 +1385,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                         break;
                     }
 
-                    if (!QueueUserWorkItem(
-                        TvVolumeWorkerProc,
-                        reinterpret_cast<LPVOID>(static_cast<intptr_t>(action)),
-                        WT_EXECUTEDEFAULT))
+                    if (!EnqueueTvVolumeAction(action))
                     {
-                        ErrorLog(L"[Key] QueueUserWorkItem failed: %lu", GetLastError());
+                        ErrorLog(L"[Key] Failed to enqueue TV volume action");
                     }
 
                     // Keep endpoint volume pinned to 100% while routing to TV.
@@ -1334,6 +1506,12 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     g_endpointWatcher = new AudioEndpointWatcher();
     if (g_endpointWatcher)
         g_endpointWatcher->Initialize();
+
+    // Create TV volume worker thread used to process volume actions.
+    if (!InitializeTvVolumeWorker())
+    {
+        DebugLog(L"[Key] InitializeTvVolumeWorker failed\n");
+    }
 
     // Install low-level keyboard hook
     g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL,
@@ -1564,6 +1742,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             UnhookWindowsHookEx(g_hKeyboardHook);
             g_hKeyboardHook = nullptr;
         }
+
+        ShutdownTvVolumeWorker();
+
         if (g_endpointWatcher)
         {
             g_endpointWatcher->Shutdown();
